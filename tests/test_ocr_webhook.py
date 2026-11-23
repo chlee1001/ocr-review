@@ -89,19 +89,18 @@ class FakeAPI:
 
 class ReviewTests(unittest.TestCase):
     def setUp(self):
-        self.service = webhook.Service({REPO: SECRET}, 'token', 'bot', '/usr/bin/ocr', GITEA_URL, SSH_BASE)
+        self.service = webhook.Service(SECRET, 'token', 'bot', '/usr/bin/ocr', GITEA_URL, SSH_BASE)
         self.service.api = FakeAPI()
-        self.job = webhook.parse_job(payload(), {REPO})
+        self.job = webhook.parse_job(payload())
 
     def test_progress_then_result_reuses_comment_and_duplicate_is_skipped(self):
-        def review(job, binary, gitea_url, ssh_base, provider):
+        def review(job, binary, gitea_url, ssh_base):
             self.assertEqual(self.service.api.events[-1], 'POST')
             self.assertIsNone(self.service.api.comment)
             self.assertEqual((gitea_url, ssh_base), (GITEA_URL, SSH_BASE))
-            self.assertEqual(provider, 'chatgpt')
             return webhook.ReviewResult('complete', '&lt;finding&gt; @\u200ball')
         with patch.object(webhook, 'run_review', side_effect=review) as run:
-            self.service.process(self.job, provider='chatgpt')
+            self.service.process(self.job)
             saves = [event for event in self.service.api.events if isinstance(event, tuple)]
             self.assertEqual([event[1] for event in saves], [None])
             self.assertIn('&lt;finding&gt;', saves[0][2])
@@ -145,7 +144,7 @@ class ReviewTests(unittest.TestCase):
         self.assertIn('ocr-success', self.service.api.comment['body'])
         self.assertEqual(self.service.api.comment['id'], 42)
 
-    def test_forks_bad_revisions_and_unknown_repositories_are_skipped(self):
+    def test_forks_bad_revisions_and_mismatched_repositories_are_skipped(self):
         for change in ('fork', 'sha', 'number', 'ref', 'repo'):
             data = payload()
             if change == 'fork':
@@ -158,7 +157,7 @@ class ReviewTests(unittest.TestCase):
                 data['pull_request']['base']['ref'] = '../escape'
             else:
                 data['repository']['full_name'] = 'other/repo'
-            self.assertIsNone(webhook.parse_job(data, {REPO}), change)
+            self.assertIsNone(webhook.parse_job(data), change)
 
     def test_only_bot_owned_marker_is_selected(self):
         api = webhook.Gitea('token', GITEA_URL)
@@ -191,7 +190,8 @@ class ReviewTests(unittest.TestCase):
         self.assertIn(BASE, checkout)
         self.assertNotIn(HEAD, checkout)
         ocr = calls[-1]
-        self.assertEqual(ocr[ocr.index('--provider') + 1], 'openai-responses')
+        self.assertNotIn('--provider', ocr)
+        self.assertNotIn('--model', ocr)
         self.assertEqual(ocr[ocr.index('--from') + 1], BASE)
         self.assertEqual(ocr[ocr.index('--to') + 1], HEAD)
         self.assertEqual(ocr[ocr.index('--format') + 1], 'json')
@@ -446,7 +446,7 @@ class ReviewTests(unittest.TestCase):
 
 class HTTPTests(unittest.TestCase):
     def setUp(self):
-        self.service = webhook.Service({REPO: SECRET, OTHER_REPO: OTHER_SECRET}, 'token', 'bot', '/usr/bin/ocr', GITEA_URL, SSH_BASE)
+        self.service = webhook.Service(SECRET, 'token', 'bot', '/usr/bin/ocr', GITEA_URL, SSH_BASE)
         self.server = HTTPServer(('127.0.0.1', 0), webhook.Handler)
         self.server.service = self.service
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -459,9 +459,13 @@ class HTTPTests(unittest.TestCase):
 
     def post(self, data, signature=None, event='pull_request', path='/gitea', secret=SECRET, raw=False):
         body = data if raw else json.dumps(data).encode()
-        signature = signature or hmac.new(secret, body, hashlib.sha256).hexdigest()
+        if signature is None:
+            signature = hmac.new(secret, body, hashlib.sha256).hexdigest()
         conn = HTTPConnection('127.0.0.1', self.server.server_port, timeout=3)
-        conn.request('POST', path, body, {'X-Gitea-Signature': signature, 'X-Gitea-Event': event})
+        headers = {'X-Gitea-Event': event}
+        if signature:
+            headers['X-Gitea-Signature'] = signature
+        conn.request('POST', path, body, headers)
         response = conn.getresponse()
         response.read()
         conn.close()
@@ -470,11 +474,13 @@ class HTTPTests(unittest.TestCase):
     def test_authentication_event_and_queue_responses(self):
         with patch.object(self.service, 'enqueue', return_value=True) as enqueue:
             self.assertEqual(self.post(payload(), signature='0' * 64), 401)
+            self.assertEqual(self.post(payload(), signature=''), 401)
+            self.assertEqual(self.post(payload(), secret=OTHER_SECRET), 401)
             self.assertEqual(self.post(payload(), event='push'), 204)
             self.assertEqual(self.post({'repository': {'full_name': REPO}}, event='push'), 204)
             self.assertEqual(self.post(payload(), path='/other'), 404)
             self.assertEqual(self.post(payload()), 202)
-            enqueue.assert_called_once_with(webhook.parse_job(payload(), {REPO}))
+            enqueue.assert_called_once_with(webhook.parse_job(payload()))
         with patch.object(self.service, 'enqueue', return_value=False):
             self.assertEqual(self.post(payload()), 503)
 
@@ -483,30 +489,36 @@ class HTTPTests(unittest.TestCase):
         data['action'] = 'closed'
         with patch.object(self.service, 'enqueue') as enqueue:
             self.assertEqual(self.post(data), 204)
-            self.assertEqual(self.post({'action': 'opened'}), 401)
+            self.assertEqual(self.post({'action': 'opened'}), 204)
             enqueue.assert_not_called()
 
-    def test_repository_scoped_secrets(self):
+    def test_instance_secret_accepts_multiple_same_repository_pull_requests(self):
         second = payload()
         second['repository']['full_name'] = OTHER_REPO
         second['pull_request']['base']['repo']['full_name'] = OTHER_REPO
         second['pull_request']['head']['repo']['full_name'] = OTHER_REPO
-        unknown = payload()
-        unknown['repository']['full_name'] = 'owner/unregistered'
         with patch.object(self.service, 'enqueue', return_value=True) as enqueue:
-            self.assertEqual(self.post(second), 401)
-            self.assertEqual(self.post(unknown), 401)
-            self.assertEqual(self.post(second, secret=OTHER_SECRET), 202)
             self.assertEqual(self.post(payload()), 202)
+            self.assertEqual(self.post(second), 202)
             self.assertEqual(enqueue.call_count, 2)
+            self.assertEqual([call.args[0].repo for call in enqueue.call_args_list], [REPO, OTHER_REPO])
+
+    def test_signed_forks_and_repository_mismatches_are_not_queued(self):
+        with patch.object(self.service, 'enqueue') as enqueue:
+            for side in ('base', 'head'):
+                data = payload()
+                data['pull_request'][side]['repo']['full_name'] = OTHER_REPO
+                self.assertEqual(self.post(data), 204)
+            enqueue.assert_not_called()
 
     def test_invalid_json_and_recursive_json_are_rejected(self):
         with patch.object(self.service, 'enqueue') as enqueue:
             self.assertEqual(self.post(b'{', raw=True), 400)
+            self.assertEqual(self.post(b'{', raw=True, secret=OTHER_SECRET), 401)
             # Decoder nesting limits differ across Python versions. A decoded
-            # array is still unauthorized because it has no repository.
-            self.assertIn(self.post(b'[' * 2000 + b']' * 2000, raw=True), (400, 401))
-            self.assertEqual(self.post({'repository': {'full_name': []}}), 401)
+            # array is still invalid because it has no pull request.
+            self.assertIn(self.post(b'[' * 2000 + b']' * 2000, raw=True), (400, 204))
+            self.assertEqual(self.post({'repository': {'full_name': []}}), 204)
             enqueue.assert_not_called()
 
     def test_oversized_body_is_rejected_before_reading(self):
@@ -546,47 +558,42 @@ class ConfigurationTests(unittest.TestCase):
             api.request('GET', '/repos/owner/repo')
         self.assertEqual(request.call_args.args[0].full_url, GITEA_URL + '/api/v1/repos/owner/repo')
 
-    def test_smoke_requires_exactly_one_registered_repository(self):
+    def test_smoke_uses_instance_secret(self):
         with tempfile.TemporaryDirectory() as directory:
             token = Path(directory) / 'token'
             token.write_text('token')
-            env = {'OCR_WEBHOOK_SECRETS_FILE': 'unused', 'OCR_GITEA_TOKEN_FILE': str(token),
+            env = {'OCR_WEBHOOK_SECRET_FILE': 'unused', 'OCR_GITEA_TOKEN_FILE': str(token),
                    'OCR_BOT_LOGIN': 'bot', 'OCR_GITEA_URL': GITEA_URL, 'OCR_GIT_SSH_BASE': SSH_BASE}
             with patch.dict(webhook.os.environ, env, clear=True), patch.object(sys, 'argv', ['ocr', '--comment-smoke']):
-                with patch.object(webhook, 'load_secrets', return_value={REPO: SECRET}), \
+                with patch.object(webhook, 'load_secret', return_value=SECRET), \
                         patch.object(webhook, 'Service') as service, patch.object(webhook, 'HTTPServer'):
                     webhook.main()
                     self.assertTrue(service.call_args.kwargs['comment_smoke'])
-                with patch.object(webhook, 'load_secrets', return_value={REPO: SECRET, OTHER_REPO: OTHER_SECRET}), \
-                        patch.object(webhook, 'Service') as service:
-                    with self.assertRaises(SystemExit):
-                        webhook.main()
-                    service.assert_not_called()
+                    self.assertEqual(service.call_args.args[0], SECRET)
 
     def load(self, content):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'secrets.json'
+            path = Path(directory) / 'secret'
             path.write_bytes(content)
-            return webhook.load_secrets(path)
+            return webhook.load_secret(path)
 
-    def test_multiple_repositories_are_immutable(self):
-        secrets = self.load(json.dumps({REPO: SECRET.decode(), OTHER_REPO: OTHER_SECRET.decode()}).encode())
-        self.assertEqual(dict(secrets), {REPO: SECRET, OTHER_REPO: OTHER_SECRET})
-        with self.assertRaises(TypeError):
-            secrets[REPO] = OTHER_SECRET
+    def test_valid_secret(self):
+        self.assertEqual(self.load(SECRET), SECRET)
+        self.assertEqual(self.load(SECRET + b'\n'), SECRET)
 
     def test_invalid_configurations_fail_closed(self):
-        cases = [b'{}', b'[]', b'{', b'\xff', b'[' * 2000 + b']' * 2000,
-                 json.dumps({'*': SECRET.decode()}).encode(),
-                 json.dumps({REPO: 'short'}).encode(),
-                 json.dumps({REPO: 123}).encode(),
-                 json.dumps({REPO: {'nested': 'value'}}).encode(),
-                 json.dumps({REPO: SECRET.decode(), OTHER_REPO: SECRET.decode()}).encode(),
-                 ('{"%s":"%s","%s":"%s"}' % (REPO, SECRET.decode(), REPO, OTHER_SECRET.decode())).encode(),
-                 b' ' * (webhook.MAX_JSON + 1)]
+        cases = [b'', b'\xff' * 64, b'a' * 63, b'a' * 65, b'A' * 64,
+                 b'g' * 64, SECRET + b'\n\n', SECRET + b'\ntrailing', b' ' * (webhook.MAX_JSON + 1)]
         for content in cases:
-            with self.subTest(content=content[:100]), self.assertRaises(ValueError):
-                self.load(content)
+            with self.subTest(length=len(content)):
+                with self.assertRaises(ValueError) as error:
+                    self.load(content)
+                self.assertEqual(str(error.exception), 'invalid webhook secret configuration')
+
+    def test_missing_secret_file_error_redacts_path(self):
+        with self.assertRaises(ValueError) as error:
+            webhook.load_secret('/missing/private-secret-path')
+        self.assertEqual(str(error.exception), 'invalid webhook secret configuration')
 
 
 if __name__ == '__main__':

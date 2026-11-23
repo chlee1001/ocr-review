@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Loopback Gitea review receiver.
 
-Required environment: OCR_WEBHOOK_SECRETS_FILE, OCR_GITEA_TOKEN_FILE,
-OCR_BOT_LOGIN, OCR_GITEA_URL, OCR_GIT_SSH_BASE. The secrets file maps repository names to unique 64-digit hex secrets.
-OCR_BIN defaults to ~/.local/bin/ocr. OCR's openai-responses provider and
-model credentials must already be configured for the service account.
+Required environment: OCR_WEBHOOK_SECRET_FILE, OCR_GITEA_TOKEN_FILE,
+OCR_BOT_LOGIN, OCR_GITEA_URL, OCR_GIT_SSH_BASE. The secret file contains exactly 64 lowercase hex characters.
+OCR_BIN defaults to ~/.local/bin/ocr. Configure the provider, model and
+credentials in OCR for the service account.
 """
 
 import argparse
@@ -25,7 +25,6 @@ import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from types import MappingProxyType
 from urllib.parse import quote, urlsplit
 
 MAX_BODY = 1024 * 1024
@@ -66,30 +65,15 @@ def base_url(value, *, ssh=False):
         raise ValueError('invalid webhook URL configuration') from error
 
 
-def load_secrets(path):
-    def unique_object(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError('duplicate webhook configuration key')
-            result[key] = value
-        return result
-
+def load_secret(path):
     try:
         with open(path, 'rb') as source:
-            raw = source.read(MAX_JSON + 1)
-        if len(raw) > MAX_JSON:
-            raise ValueError('webhook configuration too large')
-        entries = json.loads(raw, object_pairs_hook=unique_object)
-        if (not isinstance(entries, dict) or not entries
-                or any(not REPO.fullmatch(repo) or not isinstance(secret, str)
-                       or not re.fullmatch(r'[0-9a-f]{64}', secret)
-                       for repo, secret in entries.items())
-                or len(set(entries.values())) != len(entries)):
-            raise ValueError('invalid webhook configuration')
-        return MappingProxyType({repo: secret.encode('ascii') for repo, secret in entries.items()})
-    except (UnicodeError, RecursionError) as error:
-        raise ValueError('invalid webhook configuration') from error
+            secret = source.read(66).removesuffix(b'\n')
+    except OSError:
+        raise ValueError('invalid webhook secret configuration') from None
+    if not re.fullmatch(rb'[0-9a-f]{64}', secret):
+        raise ValueError('invalid webhook secret configuration')
+    return secret
 
 
 @dataclass(frozen=True)
@@ -107,7 +91,7 @@ def valid_ref(ref):
             and all(not part.startswith('.') and not part.endswith('.lock') for part in ref.split('/')))
 
 
-def parse_job(payload, allowed):
+def parse_job(payload):
     try:
         if payload['action'] not in {'opened', 'reopened', 'synchronized', 'synchronize'}:
             return None
@@ -115,7 +99,7 @@ def parse_job(payload, allowed):
         repo = payload['repository']['full_name']
         number = pr['number']
         base, head = pr['base'], pr['head']
-        if (not isinstance(repo, str) or repo not in allowed or not REPO.fullmatch(repo)
+        if (not isinstance(repo, str) or not REPO.fullmatch(repo)
                 or type(number) is not int or not 0 < number <= 2147483647
                 or base['repo']['full_name'] != repo or head['repo']['full_name'] != repo
                 or not isinstance(base['sha'], str) or not SHA.fullmatch(base['sha'])
@@ -365,12 +349,12 @@ def render_review(job, merge_base, data, returncode, source_link):
     return ReviewResult(state, header + ''.join(blocks), tuple(inline))
 
 
-def run_review(job, ocr, gitea_url, ssh_base, provider='openai-responses'):
+def run_review(job, ocr, gitea_url, ssh_base):
     with tempfile.TemporaryDirectory(prefix='ocr-review-') as tmp:
         repo_dir = Path(tmp) / 'repository'
         repo_dir.mkdir()
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith('GIT_') and k not in {'OCR_WEBHOOK_SECRETS_FILE', 'OCR_GITEA_TOKEN_FILE'}}
+               if not k.startswith('GIT_') and k not in {'OCR_WEBHOOK_SECRET_FILE', 'OCR_GITEA_TOKEN_FILE'}}
         env.update({'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull,
                     'GIT_TERMINAL_PROMPT': '0', 'GIT_LFS_SKIP_SMUDGE': '1'})
         def git(*args):
@@ -387,7 +371,7 @@ def run_review(job, ocr, gitea_url, ssh_base, provider='openai-responses'):
         merge_base = git('merge-base', job.base, job.head)
         git('checkout', '--quiet', '--detach', job.base)
         output = Path(tmp) / 'review-output.json'
-        process = subprocess.run([ocr, 'review', '--provider', provider, '--audience', 'agent',
+        process = subprocess.run([ocr, 'review', '--audience', 'agent',
                         '--color', 'never', '--effort', 'low', '--concurrency', '2', '--timeout', '5',
                         '--from', job.base, '--to', job.head, '--background', BACKGROUND,
                         '--format', 'json', '--output', str(output)],
@@ -447,8 +431,8 @@ def run_review(job, ocr, gitea_url, ssh_base, provider='openai-responses'):
 
 
 class Service:
-    def __init__(self, secrets, token, login, ocr, gitea_url, ssh_base, *, comment_smoke=False):
-        self.secrets, self.login, self.ocr = MappingProxyType(dict(secrets)), login, ocr
+    def __init__(self, secret, token, login, ocr, gitea_url, ssh_base, *, comment_smoke=False):
+        self.secret, self.login, self.ocr = secret, login, ocr
         self.gitea_url, self.ssh_base = gitea_url, ssh_base
         self.comment_smoke = comment_smoke
         self.api = Gitea(token, gitea_url)
@@ -491,7 +475,7 @@ class Service:
                     self.pending.discard(job)
                 self.jobs.task_done()
 
-    def process(self, job, *, provider='openai-responses'):
+    def process(self, job):
         if not self.api.current(job):
             return
         comment = self.api.find_comment(job, self.login)
@@ -505,7 +489,7 @@ class Service:
         try:
             try:
                 report = (ReviewResult('smoke', '[모의 결과] 댓글 연동 테스트입니다. OCR 모델을 호출하지 않았습니다.')
-                          if self.comment_smoke else run_review(job, self.ocr, self.gitea_url, self.ssh_base, provider))
+                          if self.comment_smoke else run_review(job, self.ocr, self.gitea_url, self.ssh_base))
             except (OSError, ValueError, RecursionError, subprocess.SubprocessError):
                 report = ReviewResult('failed', f'## 리뷰 실패\n\n대상 커밋: `{job.head[:12]}`')
             comment = self.api.find_comment(job, self.login)
@@ -579,22 +563,18 @@ class Handler(BaseHTTPRequestHandler):
         if len(body) != length or len(signatures) != 1 or not re.fullmatch(r'[0-9a-f]{64}', signatures[0]):
             self.reply(401)
             return
+        if not hmac.compare_digest(hmac.new(self.server.service.secret, body, hashlib.sha256).hexdigest(), signatures[0]):
+            self.reply(401)
+            return
         try:
             payload = json.loads(body)
-            repo = payload['repository']['full_name']
-            secret = self.server.service.secrets.get(repo) if isinstance(repo, str) else None
         except (ValueError, UnicodeError, RecursionError):
             self.reply(400)
-            return
-        except (KeyError, TypeError):
-            secret = None
-        if secret is None or not hmac.compare_digest(hmac.new(secret, body, hashlib.sha256).hexdigest(), signatures[0]):
-            self.reply(401)
             return
         if self.headers.get_all('X-Gitea-Event', []) != ['pull_request']:
             self.reply(204)
             return
-        job = parse_job(payload, self.server.service.secrets)
+        job = parse_job(payload)
         if not job:
             self.reply(204)
         elif self.server.service.enqueue(job):
@@ -608,16 +588,14 @@ def main():
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--comment-smoke', action='store_true', help='test comment delivery without calling OCR')
     args = parser.parse_args()
-    secrets = load_secrets(os.environ['OCR_WEBHOOK_SECRETS_FILE'])
+    secret = load_secret(os.environ['OCR_WEBHOOK_SECRET_FILE'])
     gitea_url = base_url(os.environ['OCR_GITEA_URL'])
     ssh_base = base_url(os.environ['OCR_GIT_SSH_BASE'], ssh=True)
     token = Path(os.environ['OCR_GITEA_TOKEN_FILE']).read_text().strip()
     login = os.environ['OCR_BOT_LOGIN']
     if not token or not login:
         raise ValueError('invalid webhook configuration')
-    if args.comment_smoke and len(secrets) != 1:
-        parser.error('--comment-smoke requires exactly one registered repository')
-    service = Service(secrets, token, login, os.path.expanduser(os.environ.get('OCR_BIN', '~/.local/bin/ocr')),
+    service = Service(secret, token, login, os.path.expanduser(os.environ.get('OCR_BIN', '~/.local/bin/ocr')),
                       gitea_url, ssh_base, comment_smoke=args.comment_smoke)
     server = HTTPServer(('127.0.0.1', args.port), Handler)
     server.service = service

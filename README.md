@@ -19,13 +19,17 @@ not approve, merge, or reopen pull requests.
 
 ## Register repositories
 
-1. Configure OCR for `ocr-review` with an approved `openai-responses` model and
-   CI credential. Run `ocr llm test` as that account. The model receives the
-   reviewed code. Do not reuse a personal ChatGPT session for shared reviews.
+There is no repository registry on the receiver. To onboard a repository,
+configure its Gitea webhook to use the shared `/gitea` endpoint and signing
+secret, and grant the bot access if it does not already have it.
+
+1. Configure an approved provider, model, and credential in OCR for the account
+   running the receiver. The receiver does not override the provider or model.
+   Run `ocr llm test` as that account. The model receives the reviewed code.
 2. Give the Gitea bot access only to enrolled repositories. Use `read:repository`
    for pull request lookup and `write:issue` for summary comments. Verify native
-   review permissions separately before relying on inline comments. Keep the
-   token and webhook registration file readable only by the service account
+   review permissions separately before relying on inline comments. Keep
+   the token and signing secret files readable only by the service account
    and its administrator.
 3. Run the receiver as `ocr-review`. Use absolute paths for the script,
    OCR binary, and credential files. Use the HTTPS address of your Gitea
@@ -36,7 +40,7 @@ not approve, merge, or reopen pull requests.
    OCR_GIT_SSH_BASE=ssh://git@gitea.example.org:2222 \
    OCR_BIN=/path/to/ocr \
    OCR_BOT_LOGIN=ocr-review-bot \
-   OCR_WEBHOOK_SECRETS_FILE=/path/to/repository-secrets.json \
+   OCR_WEBHOOK_SECRET_FILE=/path/to/webhook-secret \
    OCR_GITEA_TOKEN_FILE=/path/to/bot-token \
    python3 /path/to/scripts/ocr_webhook.py --port 8765
    ```
@@ -44,11 +48,11 @@ not approve, merge, or reopen pull requests.
 4. Proxy `/gitea` from an internal HTTPS address to `127.0.0.1:8765`. Limit
    access to Gitea's network source. In Gitea, open the test repository's
    **Settings → Webhooks**. Add a **Gitea** webhook with that HTTPS URL and
-   select pull request events. Generate a unique secret (`openssl rand -hex 32`)
-   for each repository. Set it on that hook and add it to the receiver's JSON
-   object under the exact repository name (for example, `example/project`).
-   Restart the receiver to load changes. A valid hook for one repository cannot
-   authorize another repository. Use the same endpoint for every registration.
+   select only **Pull Request** (`pull_request`) and **Pull Request Synchronized**
+   (`pull_request_sync`) under custom events. Generate the receiver's shared secret once
+   (`openssl rand -hex 32`) and keep it in the configured file, outside the
+   checkout. Set the same secret on each managed Gitea hook. Adding a hook
+   does not require a receiver configuration change or restart.
 5. Open a same-repository pull request with synthetic code. Look for the bot's
    👀 reaction below the pull request description during review. The bot
    removes the reaction when the review ends and posts one Markdown summary
@@ -61,22 +65,77 @@ not approve, merge, or reopen pull requests.
    findings. Push a second synthetic commit and check that the bot updates
    the same summary and does not repost the same inline finding.
 
-The webhook does not execute scripts from a pull request. Do not share a single
-organization-wide webhook secret across repository registrations.
+The webhook does not execute scripts from a pull request. The shared signing
+secret authenticates the installation, not individual repositories. Keep it
+with trusted hook administrators only. Do not share a secret between untrusted
+administrative groups. Limit the bot's access and restrict ingress to Gitea.
+
+When upgrading from `OCR_WEBHOOK_SECRETS_FILE`, replace it with
+`OCR_WEBHOOK_SECRET_FILE`, configure each managed hook with the new shared
+secret, and restart the receiver once to load the new configuration.
+
+## Run at boot on Linux
+
+Install the receiver and its virtual-machine configuration in permanent paths.
+For example, use `/opt/ocr-review` for the receiver code and `/etc/ocr-review`
+for service configuration. Keep the credential files readable only by the service
+account and its administrator. Set `HOME` to the account's actual home so OCR
+uses that account's existing provider and model configuration.
+
+Save this example as `/etc/systemd/system/ocr-review.service`, substituting the
+actual account and paths. Put the six `OCR_*` settings from the command above
+in `/etc/ocr-review/receiver.env`, one `NAME=value` per line, without shell
+continuations. Put secrets in the files referenced by those settings, not in
+the unit or the environment file.
+
+```ini
+[Unit]
+Description=OpenCodeReview webhook receiver for Gitea
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=ocr-review
+Environment=HOME=/home/ocr-review
+EnvironmentFile=/etc/ocr-review/receiver.env
+ExecStart=/usr/bin/python3 /opt/ocr-review/scripts/ocr_webhook.py --port 8765
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemd-analyze verify /etc/systemd/system/ocr-review.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ocr-review.service
+systemctl is-enabled ocr-review.service
+systemctl is-active ocr-review.service
+```
+
+Keep the receiver on loopback. When an HTTPS proxy on another host needs a
+VM listener, persist the socket and its source-IP firewall rule as well. Make
+the socket require and start after the firewall unit so it does not listen
+when the rule fails to load. Allow only the proxy's backend source address at
+the listener, and restrict ingress to Gitea at the HTTPS proxy. Verify both an
+authenticated delivery and rejection of unsigned requests after a restart.
 
 ## Verify and switch to automatic reviews
 
 - Run `python3 -m unittest discover -s tests` locally. For a delivery-only
-  check, register exactly one sandbox repository and start the receiver with
-  `--comment-smoke`. This posts a test summary without sending source to a model.
+  check, use a sandbox-only bot and a separate signing secret, and start the
+  receiver with `--comment-smoke`. This posts a test summary without sending
+  source to a model.
 - The receiver binds to loopback. If Gitea runs on a different machine, put an
   HTTPS reverse proxy in front of it and restrict inbound traffic to Gitea's
   network source. An authenticated test-delivery `204` only confirms transport
   and signing; a qualifying PR delivery returns `202` when queued, not when
   review is finished.
-- For unattended use, run the same command under the host service manager
-  (systemd on Linux or launchd on macOS), using the service account, absolute
-  paths and restart-on-failure. Keep the proxy and its access rules persistent.
+- For unattended use on macOS, run the same command under launchd with the
+  service account's home, absolute paths, and restart-on-failure behavior.
 - Validate signed delivery on a synthetic repository before switching. Remove
   `--comment-smoke` from the service command to enable model calls, restart the
   service, and use a new synthetic PR to verify delivery, model output, and
@@ -85,6 +144,6 @@ organization-wide webhook secret across repository registrations.
 - Roll back by disabling the affected Gitea webhooks or stopping the receiver.
   Restoration of the previous service must include its matching configuration.
 - Before publishing this repository, review both files and Git history. Do not
-  include real registration files, tokens, local session state, private PR
+  include real signing secrets, tokens, local session state, private PR
   fixtures, or host-specific configuration. Choose and add a license before
   distributing it as open source.
