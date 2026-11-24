@@ -68,7 +68,7 @@ class FakeAPI:
 
     def find_comment(self, job, login):
         self.events.append('find')
-        return self.comment
+        return self.comment if self.comment and webhook.head_marker(job) in self.comment['body'] else None
 
     def review_reaction(self, job, method):
         self.events.append(method)
@@ -165,9 +165,12 @@ class ReviewTests(unittest.TestCase):
             {'id': 1, 'body': webhook.MARKER, 'user': {'login': 'other'}},
             {'id': 2, 'body': 'ordinary', 'user': {'login': 'bot'}},
             {'id': 3, 'body': webhook.MARKER + '\ntext', 'user': {'login': 'bot'}},
+            {'id': 4, 'body': webhook.MARKER + '\n' + webhook.head_marker(self.job), 'user': {'login': 'bot'}},
         ]
         with patch.object(api, 'request', return_value=comments):
-            self.assertEqual(api.find_comment(self.job, 'bot')['id'], 3)
+            self.assertEqual(api.find_comment(self.job, 'bot')['id'], 4)
+            other = webhook.Job(REPO, 7, BASE, 'c' * 40, 'main')
+            self.assertIsNone(api.find_comment(other, 'bot'))
 
     def test_review_fetches_fixed_refs_and_checks_out_base(self):
         calls = []
@@ -214,6 +217,24 @@ class ReviewTests(unittest.TestCase):
             self.service.process(self.job)
         self.assertNotIn('ocr-success', self.service.api.comment['body'])
 
+    def test_guide_citations_link_to_item_headings(self):
+        guide = ('## 4. 공통 필수 점검\n\n- **G5 실패 처리**: a\n- **G8 테스트**: b\n\n'
+                 '## 5. 이 레포 필수 점검\n\n### S4 Flyway 마이그레이션\n\nc\n')
+        anchors = webhook.guide_anchors(guide)
+        self.assertEqual(anchors, {'G5': '4-공통-필수-점검', 'G8': '4-공통-필수-점검',
+                                   'S4': 's4-flyway-마이그레이션'})
+        content = '테스트가 빠졌습니다. [근거: G5 실패 처리, G8 테스트] [근거: S4 Flyway 마이그레이션, Z9 없음]'
+        report = webhook.render_review(
+            self.job, BASE, review_data(comments=[finding(content=content)]), 0, lambda *args: None,
+            lambda item: f'https://guide/x?a=1&b=2#{anchors[item]}' if item in anchors else None).markdown
+        self.assertIn('<a href="https://guide/x?a=1&amp;b=2#4-공통-필수-점검" target="_blank" '
+                      'rel="noopener noreferrer">G5 실패 처리</a>, <a href=', report)
+        self.assertIn('>G8 테스트</a>', report)
+        self.assertIn('>S4 Flyway 마이그레이션</a>, Z9 없음', report)
+        plain = webhook.render_review(self.job, BASE, review_data(comments=[finding(content=content)]), 0,
+                                      lambda *args: None).markdown
+        self.assertNotIn('<a href', plain)
+
     def test_bilingual_and_malformed_findings_remain_visible(self):
         bilingual = finding(content='합계가 넘칩니다.\n---OCR-EN---\nThe sum overflows.')
         english = finding(content='The result is wrong.')
@@ -237,7 +258,7 @@ class ReviewTests(unittest.TestCase):
 
     def test_old_success_marker_is_updated_once(self):
         self.service.api.comment = {'id': 42, 'user': {'login': 'bot'}, 'body':
-            f'{webhook.MARKER}\n<!-- ocr-success v=2 base={BASE} head={HEAD} -->\nold'}
+            f'{webhook.MARKER}\n{webhook.head_marker(self.job)}\n<!-- ocr-success v=2 base={BASE} head={HEAD} -->\nold'}
         with patch.object(webhook, 'run_review', return_value=webhook.ReviewResult('complete', 'new')) as run:
             self.service.process(self.job)
             self.service.process(self.job)
@@ -272,14 +293,20 @@ class ReviewTests(unittest.TestCase):
         self.assertNotIn('[link](https://evil.test)', report)
         self.assertIn('생략했습니다', report)
 
-    def test_new_head_updates_same_comment(self):
+    def test_new_head_posts_new_comment_and_same_head_updates_it(self):
         other = webhook.Job(REPO, 7, BASE, 'c' * 40, 'main')
         with patch.object(webhook, 'run_review', return_value=webhook.ReviewResult('complete', '완료')):
             self.service.process(self.job)
             self.service.process(other)
         saves = [event for event in self.service.api.events if isinstance(event, tuple)]
-        self.assertEqual([event[1] for event in saves], [None, 42])
+        self.assertEqual([event[1] for event in saves], [None, None])
         self.assertIn(other.head, saves[-1][2])
+        self.assertIn(webhook.head_marker(other), saves[-1][2])
+        self.service.api.comment['body'] = self.service.api.comment['body'].replace('ocr-success', 'ocr-old')
+        with patch.object(webhook, 'run_review', return_value=webhook.ReviewResult('failed', '실패')):
+            self.service.process(other)
+        saves = [event for event in self.service.api.events if isinstance(event, tuple)]
+        self.assertEqual([event[1] for event in saves], [None, None, 42])
 
     def test_stale_after_comment_lookup_is_not_published(self):
         self.service.api.states = [True, True, False]
@@ -412,6 +439,28 @@ class ReviewTests(unittest.TestCase):
         self.assertNotIn('#L2', report)
         self.assertNotIn('/src/commit/' + HEAD + '/../', report)
         self.assertNotIn('/src/commit/' + HEAD + '/deleted.py', report)
+
+    def test_guide_link_uses_base_guide(self):
+        guide = b'## 4. Common\n\n- **G8 Tests**: a\n'
+        comments = [finding(content='테스트가 빠졌습니다. [근거: G8 Tests]')]
+        def run(args, **kwargs):
+            stdout = b''
+            if 'refs/ocr/base^{commit}' in args or 'merge-base' in args:
+                stdout = (BASE + '\n').encode()
+            elif 'refs/ocr/head^{commit}' in args:
+                stdout = (HEAD + '\n').encode()
+            elif 'ls-tree' in args and ':(literal).opencodereview/review-guide.md' in args:
+                stdout = b'100644 blob 123\t.opencodereview/review-guide.md\n'
+            elif 'cat-file' in args and f'{BASE}:.opencodereview/review-guide.md' in args:
+                stdout = str(len(guide)).encode() if '-s' in args else guide
+            elif args[0] == '/usr/bin/ocr':
+                Path(args[args.index('--output') + 1]).write_text(json.dumps(review_data(comments=comments)))
+            return SimpleNamespace(stdout=stdout, returncode=0)
+        with patch.object(webhook.subprocess, 'run', side_effect=run):
+            report = webhook.run_review(self.job, '/usr/bin/ocr', GITEA_URL, SSH_BASE).markdown
+        self.assertIn(f'href="{GITEA_URL}/{REPO}/src/commit/{BASE}/.opencodereview/review-guide.md'
+                      '#user-content-4-common"', report)
+        self.assertIn('>G8 Tests</a>', report)
 
     def test_verified_ranges_use_head_context_and_bound_long_excerpts(self):
         lines = [f'line {n}' for n in range(1, 26)]

@@ -1,7 +1,7 @@
 # ocr-review
 
 This Python receiver runs [OpenCodeReview](https://github.com/alibaba/open-code-review)
-on signed Gitea pull request events and maintains one review summary per PR.
+on signed Gitea pull request events and posts one review summary per reviewed commit.
 It is a standalone integration and does not require Gitea Actions. It does
 not approve, merge, or reopen pull requests.
 
@@ -26,6 +26,9 @@ secret, and grant the bot access if it does not already have it.
 1. Configure an approved provider, model, and credential in OCR for the account
    running the receiver. The receiver does not override the provider or model.
    Run `ocr llm test` as that account. The model receives the reviewed code.
+   Run `ocr config set language Korean` as that account. OpenCodeReview's
+   system prompt otherwise says "Always respond in English", which overrides
+   the receiver's request for Korean findings.
 2. Give the Gitea bot access only to enrolled repositories. Use `read:repository`
    for pull request lookup and `write:issue` for summary comments. Verify native
    review permissions separately before relying on inline comments. Keep
@@ -58,12 +61,16 @@ secret, and grant the bot access if it does not already have it.
    removes the reaction when the review ends and posts one Markdown summary
    for the reviewed commit. Check that Korean findings show the impact and
    suggested fix, with the English text folded below. A verified source line
-   opens in a new tab. Up to three high or critical findings on verified
+   opens in a new tab. When the base commit has
+   `.opencodereview/review-guide.md`, each `[근거: G8 테스트]` item in a finding
+   links to that item's heading in the base-commit guide. Up to three high or critical findings on verified
    added lines can also appear on the native pull request diff. The summary
    retains findings when inline publishing is blocked or uncertain. A partial,
    skipped, or failed review is distinct from a completed review with no
-   findings. Push a second synthetic commit and check that the bot updates
-   the same summary and does not repost the same inline finding.
+   findings. Push a second synthetic commit and check that the bot posts a
+   new summary for that commit, leaves the earlier one in place, and does
+   not repost the same inline finding. A retry for the same commit updates
+   its existing summary instead of adding another.
 
 The webhook does not execute scripts from a pull request. The shared signing
 secret authenticates the installation, not individual repositories. Keep it

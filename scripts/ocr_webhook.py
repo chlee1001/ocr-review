@@ -36,6 +36,12 @@ EN_SEPARATOR = '\n---OCR-EN---\n'
 BACKGROUND = ('For each finding, write the content in Korean first, then the exact separator '
               '---OCR-EN--- on its own line, then an English translation of the same finding. '
               'Do not create separate findings for each language. Preserve all findings.')
+
+
+def head_marker(job):
+    return f'<!-- ocr-head {job.head} -->'
+
+
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 REPO = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\Z")
@@ -154,6 +160,7 @@ class Gitea:
                         and comment['user'].get('login') == login
                         and isinstance(comment.get('body'), str)
                         and comment['body'].startswith(MARKER)
+                        and head_marker(job) in comment['body']
                         and type(comment.get('id')) is int and comment['id'] > 0):
                     return comment
             if len(comments) < 50:
@@ -238,7 +245,41 @@ def finding_text(content):
     return safe_text(content)
 
 
-def render_review(job, merge_base, data, returncode, source_link):
+GUIDE_PATH = '.opencodereview/review-guide.md'
+CITATION = re.compile(r'\\\[근거:\u200b (.+?)\\\]')
+
+
+def heading_anchor(title):
+    return re.sub(r'[^\w\- ]', '', title.strip().lower()).replace(' ', '-')
+
+
+def guide_anchors(text):
+    anchors, section = {}, None
+    for line in text.split('\n'):
+        heading = re.match(r'#{1,6}\s+(.+?)\s*$', line)
+        if heading:
+            section = heading_anchor(heading.group(1))
+            item = re.match(r'([A-Z]\d+)\s', heading.group(1))
+        else:
+            item = re.match(r'[-*]\s+\*\*([A-Z]\d+)\s', line)
+        if item and section:
+            anchors.setdefault(item.group(1), section)
+    return anchors
+
+
+def link_citations(text, guide_link):
+    def refs(match):
+        parts = []
+        for ref in match.group(1).split(', '):
+            item = re.match(r'[A-Z]\d+(?![\w])', ref)
+            link = guide_link(item.group(0)) if item else None
+            parts.append(f'<a href="{html.escape(link, quote=True)}" target="_blank" '
+                         f'rel="noopener noreferrer">{ref}</a>' if link else ref)
+        return '\\[근거:\u200b ' + ', '.join(parts) + '\\]'
+    return CITATION.sub(refs, text)
+
+
+def render_review(job, merge_base, data, returncode, source_link, guide_link=None):
     if not isinstance(data, dict) or not isinstance(data.get('manifest'), dict):
         raise ValueError('invalid review')
     manifest = data['manifest']
@@ -325,6 +366,8 @@ def render_review(job, merge_base, data, returncode, source_link):
         severity = safe_text(severities.get(raw_severity.lower(), raw_severity) or '미분류', 80)
         category = safe_text(categories.get(raw_category.lower(), raw_category), 80)
         text = finding_text(item['content'])
+        if guide_link:
+            text = link_citations(text, guide_link)
         number = f'{len(blocks) + 1}. '
         indent = ' ' * len(number)
         description = '\n'.join(indent + part if part else '' for part in text.split('\n'))
@@ -370,6 +413,14 @@ def run_review(job, ocr, gitea_url, ssh_base):
             raise ValueError('revision changed')
         merge_base = git('merge-base', job.base, job.head)
         git('checkout', '--quiet', '--detach', job.base)
+        anchors = {}
+        try:
+            entry = git('ls-tree', job.base, '--', ':(literal)' + GUIDE_PATH)
+            if (entry.startswith(('100644 blob ', '100755 blob '))
+                    and int(git('cat-file', '-s', f'{job.base}:{GUIDE_PATH}')) <= 512 * 1024):
+                anchors = guide_anchors(git('cat-file', 'blob', f'{job.base}:{GUIDE_PATH}'))
+        except (ValueError, OSError, subprocess.SubprocessError, UnicodeError):
+            anchors = {}
         output = Path(tmp) / 'review-output.json'
         process = subprocess.run([ocr, 'review', '--audience', 'agent',
                         '--color', 'never', '--effort', 'low', '--concurrency', '2', '--timeout', '5',
@@ -427,7 +478,11 @@ def run_review(job, ocr, gitea_url, ssh_base):
                 is_added = False
             return (f'{gitea_url}/{job.repo}/src/commit/{job.head}/{quote(path, safe="/")}?display=source#L{line}',
                     is_added)
-        return render_review(job, merge_base, json.loads(data), process.returncode, source_link)
+        def guide_link(item):
+            anchor = anchors.get(item)
+            return (f'{gitea_url}/{job.repo}/src/commit/{job.base}/{GUIDE_PATH}#user-content-{quote(anchor)}'
+                    if anchor else None)
+        return render_review(job, merge_base, json.loads(data), process.returncode, source_link, guide_link)
 
 
 class Service:
@@ -508,7 +563,7 @@ class Service:
                 intent = ''.join(f'\n<!-- ocr-attempt {digest} -->' for digest in sorted(attempts))
                 notice = ('\n\n인라인 게시 여부를 확인하지 못했습니다. 아래 요약을 확인해 주세요.'
                           if attempts or (candidates and (pending or not available)) else '')
-                return f'{MARKER}{marker}{intent}\n{report.markdown}{notice}'
+                return f'{MARKER}\n{head_marker(job)}{marker}{intent}\n{report.markdown}{notice}'
             if candidates and available and not pending and not attempts:
                 attempts.update(digest for digest, _ in candidates)
                 if not self.api.current(job):
